@@ -621,6 +621,7 @@ def _resolve_sub2api_settings(args=None) -> Dict[str, Any]:
     password = str((getattr(args, "sub2api_password", None) if args else None) or SUB2API_PASSWORD or "").strip()
     group_ids_raw = (getattr(args, "sub2api_group_ids", None) if args else None) or os.getenv("SUB2API_GROUP_IDS") or "2"
     auto_upload = bool(getattr(args, "sub2api_upload", False)) or _as_bool(os.getenv("AUTO_UPLOAD_SUB2API"))
+    target_count = int(str((getattr(args, "sub2api_target_count", None) if args else None) or os.getenv("SUB2API_TARGET_COUNT") or "0").strip() or "0")
     return {
         "base_url": base_url,
         "admin_api_key": admin_api_key,
@@ -629,6 +630,7 @@ def _resolve_sub2api_settings(args=None) -> Dict[str, Any]:
         "password": password,
         "group_ids": _parse_int_csv(group_ids_raw, [2]),
         "auto_upload": auto_upload,
+        "target_count": max(0, target_count),
     }
 
 
@@ -923,6 +925,48 @@ def _sub2api_delete_account(account_id: Any, settings: Dict[str, Any]) -> bool:
 
     print(f"[Sub2Api] 删除账号 {account_id} 失败 (HTTP {resp.status_code}): {resp.text[:300]}")
     return False
+
+
+def _is_sub2api_account_available(item: Dict[str, Any]) -> bool:
+    if not isinstance(item, dict):
+        return False
+
+    for key in ("is_deleted", "deleted", "deleted_at", "disabled_at"):
+        val = item.get(key)
+        if val not in (None, False, 0, "", "0"):
+            return False
+
+    status = str(item.get("status") or item.get("account_status") or "").strip().lower()
+    if status and status in {"disabled", "deleted", "banned", "invalid", "expired", "error", "inactive"}:
+        return False
+
+    state = str(item.get("state") or "").strip().lower()
+    if state and state in {"disabled", "deleted", "banned", "invalid", "expired", "error", "inactive"}:
+        return False
+
+    credentials = item.get("credentials") if isinstance(item.get("credentials"), dict) else {}
+    if not str(credentials.get("refresh_token") or item.get("refresh_token") or "").strip():
+        return False
+
+    extra = item.get("extra") if isinstance(item.get("extra"), dict) else {}
+    privacy_mode = str(extra.get("privacy_mode") or "").strip().lower()
+    if privacy_mode == "training_set_failed":
+        return False
+
+    return True
+
+
+def _count_available_sub2api_accounts(settings: Dict[str, Any]) -> int:
+    base_url = str(settings.get("base_url") or "").rstrip("/")
+    if not base_url:
+        return 0
+    try:
+        items = _sub2api_list_accounts_by_privacy_mode(settings, privacy_mode="")
+        available = [item for item in items if _is_sub2api_account_available(item)]
+        return len(available)
+    except Exception as e:
+        print(f"[Sub2Api] 统计可用账号失败: {e}")
+        return 0
 
 
 def _clean_sub2api_failed_training_accounts(settings: Dict[str, Any], privacy_mode: str = "training_set_failed", delete: bool = True) -> Dict[str, Any]:
@@ -1619,9 +1663,9 @@ def main():
     parser.add_argument("--sub2api-password", default=os.getenv("SUB2API_PASSWORD"), help="Sub2API 管理员密码（旧登录方式）")
     parser.add_argument("--sub2api-group-ids", default=os.getenv("SUB2API_GROUP_IDS", "2"), help="Sub2API 绑定分组，逗号分隔")
     parser.add_argument("--sub2api-upload", action="store_true", help="注册成功后自动上传到 Sub2API")
+    parser.add_argument("--sub2api-target-count", type=int, default=int(os.getenv("SUB2API_TARGET_COUNT", "0")), help="Sub2API 目标可用账号数，达到后暂停注册；0 表示不限制")
     parser.add_argument("--sub2api-clean-training-set-failed", action="store_true", help="清理 Sub2API 中 privacy_mode=training_set_failed 的账号")
     parser.add_argument("--sub2api-clean-only", action="store_true", help="仅执行 Sub2API 清理，不进行注册")
-    parser.add_argument("--sub2api-clean-dry-run", action="store_true", help="仅列出命中的 training_set_failed 账号，不执行删除")
     parser.add_argument("--cpa-base-url", default=os.getenv("CPA_BASE_URL"), help="CPA 基础地址")
     parser.add_argument("--cpa-token", default=os.getenv("CPA_TOKEN"), help="CPA 管理 token (Bearer)")
     parser.add_argument("--cpa-workers", type=int, default=20, help="CPA 清理并发")
@@ -1631,6 +1675,8 @@ def main():
     parser.add_argument("--cpa-clean", action="store_true", help="注册后自动清理 CPA 失效账号")
     parser.add_argument("--cpa-upload", action="store_true", help="注册后自动上传 CPA")
     parser.add_argument("--cpa-target-count", type=int, default=300, help="目标 token 数(有效)")
+    parser.add_argument("--upload-delay-min", type=int, default=120, help="注册成功后、执行上传前的最小等待秒数")
+    parser.add_argument("--upload-delay-max", type=int, default=180, help="注册成功后、执行上传前的最大等待秒数")
     parser.add_argument("--prune-local", action="store_true", help="上传成功后删除本地 token 文件与账号行（适用于 Sub2API / CPA）")
     args = parser.parse_args()
 
@@ -1646,8 +1692,20 @@ def main():
         print(f"\n[{datetime.now().strftime('%H:%M:%S')}] >>> 流程 #{count} <<<")
 
         if args.sub2api_clean_training_set_failed:
-            _clean_sub2api_failed_training_accounts(sub2api_settings, delete=not args.sub2api_clean_dry_run)
+            _clean_sub2api_failed_training_accounts(sub2api_settings)
             if args.sub2api_clean_only:
+                if args.once:
+                    break
+                wait_time = random.randint(args.sleep_min, args.sleep_max)
+                print(f"[*] 随机休息 {wait_time} 秒...")
+                time.sleep(wait_time)
+                continue
+
+        sub2api_target_count = int(sub2api_settings.get("target_count") or 0)
+        if sub2api_settings.get("auto_upload") and sub2api_settings.get("base_url") and sub2api_target_count > 0:
+            current_sub2api_count = _count_available_sub2api_accounts(sub2api_settings)
+            print(f"[Sub2Api] 当前可用账号: {current_sub2api_count} / {sub2api_target_count}")
+            if current_sub2api_count >= sub2api_target_count:
                 if args.once:
                     break
                 wait_time = random.randint(args.sleep_min, args.sleep_max)
@@ -1701,14 +1759,23 @@ def main():
                 print(f"[本地] 解析 token_json 失败: {e}")
                 tokens = None
 
+            need_sub2api_upload = bool(tokens and sub2api_settings.get("auto_upload") and sub2api_settings.get("base_url") and tokens.get("refresh_token"))
+            need_cpa_upload = bool(args.cpa_upload)
+            if need_sub2api_upload or need_cpa_upload:
+                upload_delay_min = max(0, int(args.upload_delay_min))
+                upload_delay_max = max(upload_delay_min, int(args.upload_delay_max))
+                upload_wait_time = random.randint(upload_delay_min, upload_delay_max)
+                print(f"[*] 注册完成，等待 {upload_wait_time} 秒后开始上传...")
+                time.sleep(upload_wait_time)
+
             # 3. 自动上传 Sub2API（可选）
             sub2api_upload_ok = False
-            if tokens and sub2api_settings.get("auto_upload") and sub2api_settings.get("base_url") and tokens.get("refresh_token"):
+            if need_sub2api_upload:
                 sub2api_upload_ok = _push_account_to_sub2api(email, tokens, sub2api_settings)
 
             # 4. 上传 CPA（可选）
             cpa_upload_ok = False
-            if args.cpa_upload:
+            if need_cpa_upload:
                 cpa_upload_ok = _upload_token_to_cpa(pm, token_json, email, proxy=args.proxy or "")
 
             # 5. 上传成功后按需删除本地文件/账号行（Sub2API / CPA 任一成功即可）
@@ -1730,9 +1797,10 @@ def main():
         if args.once:
             break
 
-        wait_time = random.randint(args.sleep_min, args.sleep_max)
-        print(f"[*] 随机休息 {wait_time} 秒...")
-        time.sleep(wait_time)
+        if not res:
+            wait_time = random.randint(args.sleep_min, args.sleep_max)
+            print(f"[*] 随机休息 {wait_time} 秒...")
+            time.sleep(wait_time)
 
 if __name__ == "__main__":
     main()
