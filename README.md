@@ -15,6 +15,7 @@
 ### 🔧 资源推荐
 - [YesCaptcha](https://yescaptcha.com/i/tlkF6o)（自动验证码识别工具）
 - [LuckMail](https://mails.luckyous.com/1434E853)（outlook邮箱接码）
+- 需要低价购买 ChatGPT Plus 或 Pro，可前往 [gptnocard_bot](https://t.me/gptnocard_bot?start=_tgr_kCwipghhOTc1) 进行兑换
 
 ### ⚠️ 重要提示
 - Tavily 官方目前已关闭邮箱注册，原有注册机目前不可用，后续更新请关注上方频道
